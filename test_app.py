@@ -1,25 +1,28 @@
+import io
 import pytest
-from app import app, evaluate_password, calculate_entropy
+from app import app, db, evaluate_password, calculate_entropy
 
 @pytest.fixture
 def client():
     app.config['TESTING'] = True
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     with app.test_client() as client:
-        yield client
+        with app.app_context():
+            db.create_all()
+            yield client
+            db.drop_all()
 
 # ==========================================
 # 1. UNIT TESTS: PASSWORD ENGINE
 # ==========================================
 def test_calculate_entropy():
-    # Empty password should have 0 entropy
     assert calculate_entropy("") == 0.0
-    # Stronger passwords should have higher entropy
     assert calculate_entropy("password123") < calculate_entropy("P@ssw0rd123!#$")
 
 def test_evaluate_password_weak():
     res = evaluate_password("123456")
     assert res["status"] == "Very Weak"
-    assert "This is an extremely common blacklisted password." in res["suggestions"]
+    assert "Blacklisted password." in res["suggestions"]
 
 def test_evaluate_password_strong():
     res = evaluate_password("Cyb3rGu@rd#2026!")
@@ -39,7 +42,6 @@ def test_threat_scan_endpoint(client):
     data = response.get_json()
     assert data["success"] is True
     assert len(data["data"]) > 0
-    # Verify JSON structure and serialization
     first_item = data["data"][0]
     assert "source_ip" in first_item
     assert "is_anomaly" in first_item
@@ -50,11 +52,15 @@ def test_password_analyze_endpoint(client):
     assert response.status_code == 200
     data = response.get_json()
     assert data["success"] is True
-    assert "entropy_bits" in data["data"]
+    assert "entropy" in data["data"]
 
-def test_password_generate_endpoint(client):
-    response = client.get('/api/v1/password/generate')
+def test_upload_csv_endpoint(client):
+    csv_data = "source_ip,bytes_sent,request_rate\n10.0.0.1,500,20\n10.0.0.2,4500,250\n"
+    data = {
+        'file': (io.BytesIO(csv_data.encode('utf-8')), 'test_log.csv')
+    }
+    response = client.post('/api/v1/threats/upload-csv', data=data, content_type='multipart/form-data')
     assert response.status_code == 200
-    data = response.get_json()
-    assert data["success"] is True
-    assert len(data["password"]) == 16
+    json_data = response.get_json()
+    assert json_data["success"] is True
+    assert json_data["total_scanned"] == 2

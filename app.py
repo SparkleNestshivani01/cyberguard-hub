@@ -174,19 +174,170 @@ def api_scan_threats():
     analysis = detector.analyze_logs(logs)
     return jsonify({"success": True, "data": analysis}), 200
 
-@app.route('/api/v1/password/analyze', methods=['POST'])
-def api_analyze_password():
-    data = request.get_json(force=True)
-    password = data.get("password", "")
-    if len(password) > 256:
-        return jsonify({"error": "Password exceeds limits"}), 400
-    return jsonify({"success": True, "data": evaluate_password(password)}), 200
+import os
+import math
+import re
+from datetime import datetime
+import pandas as pd
+import numpy as np
+from flask import Flask, render_template, jsonify, request
+from flask_sqlalchemy import SQLAlchemy
+from sklearn.ensemble import IsolationForest
 
-@app.route('/api/v1/password/generate', methods=['GET'])
-def api_generate_password():
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-    pwd = ''.join(secrets.choice(alphabet) for _ in range(16))
-    return jsonify({"success": True, "password": pwd}), 200
+app = Flask(__name__)
+
+# Database Configuration (SQLite)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cyberguard.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Database Models
+class ThreatLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    source_ip = db.Column(db.String(50), nullable=False)
+    bytes_sent = db.Column(db.Float, nullable=False)
+    request_rate = db.Column(db.Float, nullable=False)
+    is_anomaly = db.Column(db.Boolean, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+with app.app_context():
+    db.create_all()
+
+# Common weak passwords
+WEAK_PASSWORDS = {
+    "123456", "password", "123456789", "12345678", "12345",
+    "1234567", "1234", "qwerty", "111111", "admin"
+}
+
+def generate_mock_traffic(n_samples=20):
+    np.random.seed()
+    normal_bytes = np.random.normal(loc=500, scale=100, size=int(n_samples * 0.9))
+    normal_rates = np.random.normal(loc=20, scale=5, size=int(n_samples * 0.9))
+    
+    anomaly_bytes = np.random.uniform(low=2000, high=5000, size=int(n_samples * 0.1))
+    anomaly_rates = np.random.uniform(low=100, high=300, size=int(n_samples * 0.1))
+    
+    bytes_sent = np.concatenate([normal_bytes, anomaly_bytes])
+    req_rates = np.concatenate([normal_rates, anomaly_rates])
+    ip_addrs = [f"192.168.1.{np.random.randint(2, 254)}" for _ in range(n_samples)]
+    
+    return pd.DataFrame({
+        'source_ip': ip_addrs,
+        'bytes_sent': np.round(bytes_sent, 2),
+        'request_rate': np.round(req_rates, 2)
+    })
+
+def process_and_save_logs(df):
+    model = IsolationForest(contamination=0.1, random_state=42)
+    features = df[['bytes_sent', 'request_rate']].fillna(0)
+    df['anomaly_score'] = model.fit_predict(features)
+    df['is_anomaly'] = df['anomaly_score'].apply(lambda x: True if x == -1 else False)
+    
+    # Save to SQLite Database
+    logs_to_db = []
+    for _, row in df.iterrows():
+        log_entry = ThreatLog(
+            source_ip=str(row['source_ip']),
+            bytes_sent=float(row['bytes_sent']),
+            request_rate=float(row['request_rate']),
+            is_anomaly=bool(row['is_anomaly'])
+        )
+        logs_to_db.append(log_entry)
+        
+    db.session.add_all(logs_to_db)
+    db.session.commit()
+    return df
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/api/v1/threats/scan', methods=['POST'])
+def threat_scan():
+    df = generate_mock_traffic(20)
+    df = process_and_save_logs(df)
+    
+    # Fetch top 50 recent records from DB
+    recent_logs = ThreatLog.query.order_by(ThreatLog.timestamp.desc()).limit(50).all()
+    
+    return jsonify({
+        "success": True,
+        "total_scanned": len(recent_logs),
+        "anomalies_detected": len([l for l in recent_logs if l.is_anomaly]),
+        "data": [{
+            "id": l.id,
+            "source_ip": l.source_ip,
+            "bytes_sent": l.bytes_sent,
+            "request_rate": l.request_rate,
+            "is_anomaly": l.is_anomaly,
+            "timestamp": l.timestamp.strftime("%H:%M:%S")
+        } for l in recent_logs]
+    })
+
+@app.route('/api/v1/threats/upload-csv', methods=['POST'])
+def upload_csv():
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "Empty file selection"}), 400
+
+    try:
+        df = pd.read_csv(file)
+        if not all(col in df.columns for col in ['bytes_sent', 'request_rate']):
+            return jsonify({"success": False, "error": "CSV must contain headers: bytes_sent, request_rate"}), 400
+
+        if 'source_ip' not in df.columns:
+            df['source_ip'] = [f"10.0.0.{i+1}" for i in range(len(df))]
+
+        df = process_and_save_logs(df)
+        recent_logs = ThreatLog.query.order_by(ThreatLog.timestamp.desc()).limit(50).all()
+        
+        return jsonify({
+            "success": True,
+            "total_scanned": len(recent_logs),
+            "anomalies_detected": len([l for l in recent_logs if l.is_anomaly]),
+            "data": [{
+                "id": l.id,
+                "source_ip": l.source_ip,
+                "bytes_sent": l.bytes_sent,
+                "request_rate": l.request_rate,
+                "is_anomaly": l.is_anomaly,
+                "timestamp": l.timestamp.strftime("%H:%M:%S")
+            } for l in recent_logs]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+def calculate_entropy(password):
+    if not password: return 0.0
+    pool_size = 0
+    if re.search(r'[a-z]', password): pool_size += 26
+    if re.search(r'[A-Z]', password): pool_size += 26
+    if re.search(r'[0-9]', password): pool_size += 10
+    if re.search(r'[^a-zA-Z0-9]', password): pool_size += 32
+    return round(len(password) * math.log2(pool_size), 2) if pool_size > 0 else 0.0
+
+def evaluate_password(password):
+    entropy = calculate_entropy(password)
+    suggestions = []
+    if password.lower() in WEAK_PASSWORDS:
+        return {"score": 10, "status": "Very Weak", "entropy": entropy, "suggestions": ["Blacklisted password."]}
+    if len(password) < 8: suggestions.append("Increase length to 12+ chars.")
+    if not re.search(r'[A-Z]', password): suggestions.append("Add uppercase letters.")
+    if not re.search(r'[0-9]', password): suggestions.append("Add numbers.")
+    if not re.search(r'[^a-zA-Z0-9]', password): suggestions.append("Add special characters.")
+    
+    score = min(100, int((entropy / 80.0) * 100))
+    status = "Very Strong" if score >= 80 else ("Strong" if score >= 60 else ("Moderate" if score >= 40 else "Weak"))
+    return {"score": score, "status": status, "entropy": entropy, "suggestions": suggestions or ["Password is strong."]}
+
+@app.route('/api/v1/password/analyze', methods=['POST'])
+def password_analyze():
+    data = request.get_json() or {}
+    analysis = evaluate_password(data.get("password", ""))
+    return jsonify({"success": True, "data": analysis})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
